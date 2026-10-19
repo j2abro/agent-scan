@@ -252,13 +252,21 @@ SECRETISH = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CRED",
 # Below this, a value is a flag or a timeout rather than a secret. It does not
 # make the remaining matches credentials, it only removes the obvious noise.
 CRED_MIN_LEN = 10
+# Variables a harness or a sandbox injects for its own plumbing: IPC tokens,
+# session identifiers, proxy auth for an egress filter. They match the name
+# heuristic but they are not credentials to external services, and counting
+# them as exposure gets the direction backwards. What matters is the group
+# that was already in your own environment.
+PLUMBING_PREFIX = ("CLAUDE_CODE_", "CLAUDECODE", "CURSOR_", "TERM_SESSION",
+                   "CLOUDSDK_PROXY", "GITHUB_ACTIONS", "CI_", "API_TIMEOUT",
+                   "USE_LOCAL_OAUTH", "USE_STAGING_OAUTH")
 
 def run_report():
     print("=" * 70)
     print(f"AGENT CONTEXT REPORT")
     print(f"  platform    {PLATFORM}")
     print(f"  containment {CONTAIN}"
-          f"{'   <- NOTHING IS CONTAINING THIS AGENT' if CONTAIN == 'vanilla' else ''}")
+          f"{'   (no marker found; the verdict decides from measurements)' if CONTAIN == 'vanilla' else ''}")
     print(f"  harness     {HARNESS}")
     print("=" * 70)
 
@@ -282,13 +290,22 @@ def run_report():
     env = os.environ
     hits = sorted(k for k in env if any(s in k.upper() for s in SECRETISH))
     plausible = [k for k in hits if len(env[k]) >= CRED_MIN_LEN]
-    print(f"\n[secret] environment: {len(env)} vars, {len(hits)} name matches, "
-          f"{len(plausible)} with a credential-length value")
+    yours = [k for k in plausible if not k.startswith(PLUMBING_PREFIX)]
+    plumbing = [k for k in plausible if k.startswith(PLUMBING_PREFIX)]
+    print(f"\n[secret] environment: {len(env)} vars, {len(hits)} name matches")
     print(f"  (names matched against {'/'.join(SECRETISH)}; values never read)")
-    for k in hits:
-        n = len(env[k])
-        mark = "credential-length" if n >= CRED_MIN_LEN else "too short, likely a flag"
-        print(f"  {k:38} {n:>4} chars   {mark}")
+    print(f"\n  YOURS, {len(yours)} credential-length. These were in your own")
+    print("  environment and every process you start inherits them:")
+    for k in yours:
+        print(f"    {k:36} {len(env[k]):>4} chars")
+    if plumbing:
+        print(f"\n  Harness or sandbox plumbing, {len(plumbing)}. Session ids, IPC")
+        print("  tokens, proxy auth for the egress filter. Not external credentials:")
+        for k in plumbing:
+            print(f"    {k:36} {len(env[k]):>4} chars")
+    short = [k for k in hits if k not in plausible]
+    if short:
+        print(f"\n  Too short to be secrets, {len(short)}: {', '.join(short)}")
 
     sock = env.get("SSH_AUTH_SOCK")
     if sock:
@@ -340,10 +357,11 @@ def run_report():
     # since those restrict writes far more than reads. Creates a file named
     # .scanprobe and removes it again, nothing else.
     print("\n[fs] writable (probe file created and removed)")
+    writable = []
     for p in [os.getcwd(), "/tmp", HOME, "/etc", "/usr/local", "/var/tmp",
               os.path.join(HOME, ".config"), os.path.join(HOME, ".claude")]:
         try:
-            do_write(p); r = "WRITABLE"
+            do_write(p); r = "WRITABLE"; writable.append(p)
         except Exception as e:
             r = classify(e)
         print(f"  {r:10} {p.replace(HOME, '~')}")
@@ -369,9 +387,19 @@ def run_report():
     print("VERDICT")
     print("=" * 70)
     said = False
-    if CONTAIN == "vanilla":
-        print("\n  Nothing is containing this agent. No sandbox, no policy,")
-        print("  no kernel level limit on what it can reach.")
+    egress_open = len(reached) >= 2
+    writes_open = len(writable) >= 2
+    if egress_open and writes_open:
+        print("\n  Nothing is containing this agent. It reached unrelated hosts")
+        print("  and wrote outside its working directory.")
+        said = True
+    else:
+        print("\n  Something is containing this agent:")
+        if not egress_open:
+            print(f"    egress: {len(reached)} of {len(NET_CANDIDATES)} targets reachable")
+        if not writes_open:
+            print(f"    writes: confined to {len(writable)} of 8 locations tested")
+        print("  Note what this does NOT stop: reads. See below.")
         said = True
     creds = [p for p, c in FS_CANDIDATES if c == "secret" and p.startswith(HOME)]
     got = []
@@ -390,18 +418,23 @@ def run_report():
         print("  every host your keys reach, and sign commits as you, without")
         print("  reading any key file.")
         said = True
-    if plausible:
-        print(f"\n  It holds {len(plausible)} credential-length values in its")
-        print(f"  environment ({len(hits)} names matched, the rest are flags),")
-        print("  readable by anything it runs.")
+    if yours:
+        print(f"\n  It inherited {len(yours)} of your own credentials from the")
+        print(f"  environment ({', '.join(yours)}), readable by anything it runs.")
+        print("  These were already there. The agent did not add them.")
         said = True
-    if len(reached) >= 2:
+    if egress_open:
         print(f"\n  No egress allowlist. It reached {len(reached)} unrelated")
         print("  hosts, so anything above can leave.")
         said = True
+    elif got:
+        print("\n  It can still READ the credentials above, but egress is")
+        print("  filtered, so it cannot send them anywhere. A sandbox limits")
+        print("  blast radius; it does not stop an agent reading secrets.")
+        said = True
     clients = [b for b in ("ssh", "curl", "wget", "nc", "docker", "git")
                if shutil.which(b)]
-    if clients and len(reached) >= 2:
+    if clients and egress_open:
         print(f"\n  Clients available to do it: {', '.join(clients)}.")
         said = True
     if not said:
