@@ -43,6 +43,7 @@ import fnmatch
 import json
 import os
 import shutil
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -307,13 +308,34 @@ def run_report():
     if short:
         print(f"\n  Too short to be secrets, {len(short)}: {', '.join(short)}")
 
+    # A reachable socket is not the same as a usable one. ssh-add -l exits 0
+    # when the agent holds identities, 1 when it is reachable but empty, and 2
+    # when it cannot be contacted. Only exit 0 means it can sign for you.
+    agent_keys = 0
     sock = env.get("SSH_AUTH_SOCK")
-    if sock:
-        live = os.path.exists(sock)
-        print(f"\n[secret] SSH agent socket {'live' if live else 'declared but absent'}")
-        if live:
-            print("  Authenticates as you without reading any key file, so a")
-            print("  filesystem rule does not close it.")
+    if not sock:
+        state = "no SSH_AUTH_SOCK set"
+    elif not os.path.exists(sock):
+        state = "declared but the socket is absent"
+    elif not shutil.which("ssh-add"):
+        state = "socket present, no ssh-add to query it"
+    else:
+        r = subprocess.run(["ssh-add", "-l"], capture_output=True, text=True)
+        if r.returncode == 0:
+            agent_keys = len([l for l in r.stdout.splitlines() if l.strip()])
+            state = f"LOADED, holding {agent_keys} key(s)"
+        elif r.returncode == 1:
+            state = "reachable but holding no keys"
+        else:
+            state = "socket present, agent did not answer"
+    print(f"\n[secret] SSH agent: {state}")
+    if agent_keys:
+        print("  Signs as you without any key file being read, so a filesystem")
+        print("  rule does not close it.")
+    elif sock and os.path.exists(sock):
+        print("  The channel exists but is unloaded. On macOS a key is often")
+        print("  added on first use, so this can become loaded later in a")
+        print("  session without anything changing here.")
 
     print("\n[escape] mounts")
     found = 0
@@ -413,10 +435,10 @@ def run_report():
         for g in got:
             print(f"    {g}")
         said = True
-    if os.environ.get("SSH_AUTH_SOCK") and os.path.exists(os.environ["SSH_AUTH_SOCK"]):
-        print("\n  The SSH agent socket is live. It can authenticate as you to")
-        print("  every host your keys reach, and sign commits as you, without")
-        print("  reading any key file.")
+    if agent_keys:
+        print(f"\n  The SSH agent holds {agent_keys} key(s). It can authenticate as")
+        print("  you to every host those keys reach, and sign commits as you,")
+        print("  without reading any key file.")
         said = True
     if yours:
         print(f"\n  It inherited {len(yours)} of your own credentials from the")
